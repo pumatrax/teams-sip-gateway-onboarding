@@ -50,8 +50,39 @@ LOG_FILE="${OUT_DIR}/workflow.log"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 join_url() {
     printf '%s/%s' "${1%/}" "$2"
+}
+
+redact_url() {
+    printf '%s\n' "$1" |
+        sed -E \
+            -e 's#(/device/ob/)[^/]+#\1<OB-HASH>#' \
+            -e 's#(/device/state/OnBoarding/mmiiaacc/)[^/]+#\1<STATE-TOKEN>#' \
+            -e 's#(/device/mmiiaacc/)[^/]+#\1<STATE-TOKEN>#'
+}
+
+# Read a single line into the named variable, failing cleanly on EOF
+# (e.g. piped/redirected stdin) instead of dying under `set -e` with no message.
+# Returns 2 on EOF so callers can distinguish "no input" from other failures.
+read_line() {
+    local __var="$1"
+    local __prompt="$2"
+    local __value
+
+    printf '%s' "$__prompt"
+
+    if ! IFS= read -r __value; then
+        echo >&2
+        echo "Error: input ended before a response was received." >&2
+        return 2
+    fi
+
+    printf -v "$__var" '%s' "$__value"
 }
 
 confirm() {
@@ -78,6 +109,25 @@ confirm() {
     done
 }
 
+require_confirmation() {
+    local prompt="$1"
+    local rc
+
+    if confirm "$prompt"; then
+        return 0
+    else
+        rc=$?
+    fi
+
+    case "$rc" in
+        1) return 1 ;;
+        *)
+            echo "Error: confirmation input failed." >&2
+            exit 1
+            ;;
+    esac
+}
+
 fetch_cfg() {
     local base_url="$1"
     local output="$2"
@@ -89,7 +139,7 @@ fetch_cfg() {
 
     echo
     echo "$label"
-    echo "  URL:        $request_url"
+    echo "  URL:        $(redact_url "$request_url")"
     echo "  User-Agent: $USER_AGENT"
 
     status="$(
@@ -106,7 +156,7 @@ fetch_cfg() {
             --write-out '%{http_code}' \
             "$request_url"
     )" || {
-        echo "Error: curl failed for $request_url" >&2
+        echo "Error: curl failed for $(redact_url "$request_url")" >&2
         rm -f "$output"
         return 1
     }
@@ -125,13 +175,14 @@ fetch_cfg() {
 extract_next_url() {
     local config_file="$1"
     local value
+    local rc
 
     if [[ ! -r "$config_file" ]]; then
         echo "Error: cannot read configuration file: $config_file" >&2
         return 2
     fi
 
-    if ! value="$(
+    if value="$(
         awk '
             {
                 gsub(/\r/, "", $0)
@@ -151,22 +202,34 @@ extract_next_url() {
 
             END {
                 if (!found) {
-                    exit 1
+                    exit 10
                 }
             }
         ' "$config_file"
     )"; then
-        return 1
+        printf '%s\n' "$value"
+        return 0
+    else
+        rc=$?
     fi
 
-    printf '%s\n' "$value"
+    case "$rc" in
+        10) return 1 ;;
+        *)
+            echo "Error: awk failed while parsing: $config_file" >&2
+            return 2
+            ;;
+    esac
 }
 
 file_hash() {
     if command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$1" | awk '{print $1}'
-    else
+    elif command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
+    else
+        echo "Error: no SHA-256 tool (shasum or sha256sum) found." >&2
+        return 1
     fi
 }
 
@@ -188,6 +251,72 @@ show_credential_summary() {
     fi
 }
 
+# Classify a downloaded Stage 3 config by reading what the stage itself provides,
+# rather than pattern-matching a hard-coded SBC hostname.
+#
+# The onboarding flow's own signals:
+#   - Temporary state: account uses an @onboarding.org user_name, and/or the
+#     provisioning URL still points at the OnBoarding state path.
+#   - Final state: the temporary @onboarding.org account is gone AND the
+#     returned provisioning URL has explicitly moved to the persistent
+#     /device/mmiiaacc/ device path.
+#   - Anything else (including a parse/read failure, or a changed-but-ambiguous
+#     config) is reported as unknown so the caller can save it for review
+#     instead of acting on weak evidence.
+#
+# Prints one of: final | temporary | unknown
+classify_config() {
+    local config_file="$1"
+    local next_url=""
+    local rc
+    local has_temp_account="no"
+    local url_is_onboarding="no"
+
+    if next_url="$(extract_next_url "$config_file")"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    # A parser or file-read failure must not be treated as a final config.
+    if [[ "$rc" -eq 2 ]]; then
+        printf 'unknown\n'
+        return 0
+    fi
+
+    if grep -Eiq \
+        '^[[:space:]]*account\.[0-9]+\.user_name[[:space:]]*=.*@onboarding\.org' \
+        "$config_file"; then
+        has_temp_account="yes"
+    fi
+
+    if [[ "$rc" -eq 0 ]]; then
+        case "$next_url" in
+            */device/state/OnBoarding/*|*/device/ob/*)
+                url_is_onboarding="yes"
+                ;;
+        esac
+    fi
+
+    if [[ "$has_temp_account" == "yes" || "$url_is_onboarding" == "yes" ]]; then
+        printf 'temporary\n'
+        return 0
+    fi
+
+    # Strong final signal: the temporary identity is gone and the returned
+    # provisioning URL has explicitly moved to a persistent device path.
+    if [[ "$has_temp_account" == "no" &&
+          "$rc" -eq 0 &&
+          "$next_url" == *"/device/mmiiaacc/"* ]]; then
+        printf 'final\n'
+        return 0
+    fi
+
+    # The file changed, but there is not enough evidence to call it final.
+    printf 'unknown\n'
+    return 0
+}
+
 save_session() {
     cat > "$SESSION_FILE" <<EOF_SESSION
 MAC='$MAC'
@@ -199,7 +328,13 @@ STAGE1_URL='$INITIAL_URL'
 STAGE2_URL='$STAGE2_URL'
 STAGE3_URL='$STAGE3_URL'
 EOF_SESSION
+
+    chmod 600 "$SESSION_FILE"
 }
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
 
 echo "============================================================"
 echo "Teams SIP onboarding workflow"
@@ -237,7 +372,7 @@ case "$rc" in
         ;;
 esac
 
-echo "  Stage 2 URL: $STAGE2_URL"
+echo "  Stage 2 URL: $(redact_url "$STAGE2_URL")"
 
 # ---------------------------------------------------------------------------
 # Download Stage 2 immediately and preserve Stage 3.
@@ -272,7 +407,7 @@ echo "  Stage 1: $STAGE1_FILE"
 echo "  Stage 2: $STAGE2_FILE"
 echo
 echo "Preserved Stage 3 URL:"
-echo "  $STAGE3_URL"
+echo "  $(redact_url "$STAGE3_URL")"
 echo
 echo "Stage 2 SHA-256:"
 echo "  $STAGE2_HASH"
@@ -288,7 +423,7 @@ echo "ACTION REQUIRED - STAGE 1:"
 echo "  Upload/import Stage 1 into the phone:"
 echo "  $STAGE1_FILE"
 
-if ! confirm "Has Stage 1 finished importing?"; then
+if ! require_confirmation "Has Stage 1 finished importing?"; then
     echo "Stopped. All downloaded files remain in: $OUT_DIR"
     exit 0
 fi
@@ -305,7 +440,7 @@ echo
 echo "  The phone should reboot after Stage 2 is applied."
 echo "  When it returns, it should show connected and ready for onboarding."
 
-if ! confirm "Has Stage 2 finished importing and has the phone completed its reboot?"; then
+if ! require_confirmation "Has Stage 2 finished importing and has the phone completed its reboot?"; then
     echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
     exit 0
 fi
@@ -315,8 +450,9 @@ fi
 # ---------------------------------------------------------------------------
 
 echo
-printf 'Enter the TAC provisioning verification code: '
-IFS= read -r VERIFY_CODE
+if ! read_line VERIFY_CODE 'Enter the TAC provisioning verification code: '; then
+    exit 1
+fi
 
 if [[ -z "$VERIFY_CODE" ]]; then
     echo "Error: no verification code entered." >&2
@@ -327,7 +463,7 @@ echo
 echo "Dial this from the phone:"
 echo "  *55*${VERIFY_CODE}"
 
-if ! confirm "Did the *55* call complete and place the device into sign-in mode?"; then
+if ! require_confirmation "Did the *55* call complete and place the device into sign-in mode?"; then
     echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
     exit 0
 fi
@@ -340,7 +476,7 @@ echo
 echo "Complete Teams sign-in in a computer browser"
 echo "using the Teams phone user account."
 
-if ! confirm "Is the browser sign-in fully completed?"; then
+if ! require_confirmation "Is the browser sign-in fully completed?"; then
     echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
     exit 0
 fi
@@ -350,8 +486,9 @@ fi
 # ---------------------------------------------------------------------------
 
 echo
-printf 'Minutes to wait before the first Stage 3 check [3]: '
-IFS= read -r WAIT_MINUTES
+if ! read_line WAIT_MINUTES 'Minutes to wait before the first Stage 3 check [3]: '; then
+    exit 1
+fi
 WAIT_MINUTES="${WAIT_MINUTES:-3}"
 
 if [[ ! "$WAIT_MINUTES" =~ ^[0-9]+$ ]]; then
@@ -359,12 +496,13 @@ if [[ ! "$WAIT_MINUTES" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-printf 'Maximum minutes to poll Stage 3 [10]: '
-IFS= read -r POLL_MINUTES
-POLL_MINUTES="${POLL_MINUTES:-10}"
+if ! read_line POLL_ATTEMPTS 'Maximum number of Stage 3 checks [10]: '; then
+    exit 1
+fi
+POLL_ATTEMPTS="${POLL_ATTEMPTS:-10}"
 
-if [[ ! "$POLL_MINUTES" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: polling time must be a positive whole number." >&2
+if [[ ! "$POLL_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: number of checks must be a positive whole number." >&2
     exit 2
 fi
 
@@ -373,38 +511,70 @@ echo "Waiting ${WAIT_MINUTES} minute(s) before checking the preserved Stage 3 UR
 sleep "$((WAIT_MINUTES * 60))"
 
 FINAL_FILE="${OUT_DIR}/${MAC}-stage3-final.cfg"
+CANDIDATE_FILE="${OUT_DIR}/${MAC}-stage3-changed.cfg"
 UPDATED=0
+CANDIDATE_SAVED=0
 attempt=1
 
-while [[ "$attempt" -le "$POLL_MINUTES" ]]; do
+while [[ "$attempt" -le "$POLL_ATTEMPTS" ]]; do
     ATTEMPT_FILE="${OUT_DIR}/${MAC}-stage3-attempt${attempt}.cfg"
 
     echo
-    echo "Stage 3 check $attempt of $POLL_MINUTES"
+    echo "Stage 3 check $attempt of $POLL_ATTEMPTS"
     echo "  Reusing preserved URL:"
-    echo "  $STAGE3_URL"
+    echo "  $(redact_url "$STAGE3_URL")"
 
     if fetch_cfg "$STAGE3_URL" "$ATTEMPT_FILE" "Stage 3 download"; then
         ATTEMPT_HASH="$(file_hash "$ATTEMPT_FILE")"
         echo "  Stage 3 SHA-256: $ATTEMPT_HASH"
 
-        if [[ "$ATTEMPT_HASH" != "$STAGE2_HASH" ]]; then
-            cp "$ATTEMPT_FILE" "$FINAL_FILE"
-            UPDATED=1
+        if [[ "$ATTEMPT_HASH" == "$STAGE2_HASH" ]]; then
+            echo "Stage 3 is still identical to Stage 2 (still onboarding)."
+        else
+            # The config changed. Classify it by the stage's own signals
+            # (temporary onboarding account / provisioning URL transition),
+            # not by a hard-coded SBC hostname.
+            state="$(classify_config "$ATTEMPT_FILE")"
+            echo "  Config changed from Stage 2. Classification: $state"
 
-            echo
-            echo "Stage 3 changed from the temporary Stage 2 configuration."
-            echo "Final configuration saved as:"
-            echo "  $FINAL_FILE"
+            case "$state" in
+                final)
+                    cp "$ATTEMPT_FILE" "$FINAL_FILE"
+                    chmod 600 "$FINAL_FILE"
+                    UPDATED=1
 
-            show_credential_summary "$FINAL_FILE"
-            break
+                    echo
+                    echo "Final Stage 3 configuration detected."
+                    echo "  (Temporary onboarding account cleared; provisioning URL"
+                    echo "   moved to the persistent /device/mmiiaacc/ path.)"
+                    echo "Final configuration saved as:"
+                    echo "  $FINAL_FILE"
+
+                    show_credential_summary "$FINAL_FILE"
+                    break
+                    ;;
+                temporary)
+                    echo "Config changed but still shows onboarding-stage indicators."
+                    echo "Continuing to poll the same preserved URL."
+                    ;;
+                *)
+                    # Changed, but neither clearly temporary nor clearly final.
+                    # Do NOT discard it: save the most recent changed config as a
+                    # candidate so a naming/convention surprise degrades to
+                    # "here's a likely-final config, verify it" instead of a loss.
+                    cp "$ATTEMPT_FILE" "$CANDIDATE_FILE"
+                    chmod 600 "$CANDIDATE_FILE"
+                    CANDIDATE_SAVED=1
+                    echo "Config changed but could not be positively classified."
+                    echo "Saved as a candidate for manual review:"
+                    echo "  $CANDIDATE_FILE"
+                    echo "Continuing to poll in case a clearer final config arrives."
+                    ;;
+            esac
         fi
-
-        echo "Stage 3 is still identical to Stage 2."
     fi
 
-    if [[ "$attempt" -lt "$POLL_MINUTES" ]]; then
+    if [[ "$attempt" -lt "$POLL_ATTEMPTS" ]]; then
         echo "Waiting 60 seconds before checking the same URL again..."
         sleep 60
     fi
@@ -419,6 +589,14 @@ if [[ "$UPDATED" -eq 1 ]]; then
     echo "Final onboarding configuration detected."
     echo "Upload/import this file into the phone:"
     echo "  $FINAL_FILE"
+elif [[ "$CANDIDATE_SAVED" -eq 1 ]]; then
+    echo "No positively-verified final config was detected, but the Stage 3"
+    echo "configuration DID change from Stage 2. A candidate was saved:"
+    echo "  $CANDIDATE_FILE"
+    echo
+    echo "Review it manually. If it contains your assigned user account and a"
+    echo "production (non-onboarding) SIP server, it is likely the final config."
+    echo "Do not rerun Stage 1 or Stage 2."
 else
     echo "No Stage 3 change was detected during the polling window."
     echo "Do not rerun Stage 1 or Stage 2."
@@ -426,10 +604,14 @@ else
     echo "  $SESSION_FILE"
     echo
     echo "Manual retry command:"
-    echo "curl -v -L \\"
-    echo "  -A \"$USER_AGENT\" \\"
-    echo "  \"$(join_url "$STAGE3_URL" "${MAC}.cfg")\" \\"
-    echo "  -o \"${MAC}-stage3-later.cfg\""
+    echo "  Source the protected session file first:"
+    echo "    . \"$SESSION_FILE\""
+    echo
+    echo "  Then run:"
+    echo "    curl -v -L \\"
+    echo "      -A \"\$USER_AGENT\" \\"
+    echo "      \"\${STAGE3_URL%/}/\${MAC}.cfg\" \\"
+    echo "      -o \"\${MAC}-stage3-later.cfg\""
 fi
 
 echo
