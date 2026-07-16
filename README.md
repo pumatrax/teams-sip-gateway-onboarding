@@ -152,11 +152,6 @@ Do not commit generated `.cfg` files, `session.env`, workflow logs, packet captu
 
 See the included Word guide for the full procedure and troubleshooting notes.
 
-## Current test status
-
-The control flow and staged retrieval have been tested. A complete final validation should be performed with a real lab Yealink phone because the `*55*<verification-code>` step requires an actual temporary SIP account registered on a device.
-
-
 ## Tested lab hardware
 
 The following photos show Yealink hardware connected to Microsoft Teams SIP Gateway in the lab.
