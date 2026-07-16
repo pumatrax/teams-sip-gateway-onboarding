@@ -114,7 +114,7 @@ It also normally changes the provisioning path to:
 https://usea.dm.sdg.teams.microsoft.com/device/mmiiaacc/<STATE-TOKEN>/lang_en/
 ```
 
-## Correct interactive workflow
+## Interactive onboarding workflow
 
 The script performs the steps in this order:
 
