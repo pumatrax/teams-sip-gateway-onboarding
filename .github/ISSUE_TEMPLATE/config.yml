@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Microsoft Teams SIP Gateway documentation
+    url: https://learn.microsoft.com/en-us/microsoftteams/devices/sip-gateway-plan
+    about: Check current compatible-device and firmware guidance.
