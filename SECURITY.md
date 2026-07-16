@@ -1,16 +1,17 @@
 # Security Policy
 
-This project handles provisioning files that may contain live SIP credentials and Microsoft onboarding session tokens.
+Generated provisioning files can contain live SIP usernames, authentication names, passwords, phone numbers, tenant domains, and Microsoft onboarding state tokens.
 
-Do not open a public issue containing:
+Do not publish:
 
 - real MAC addresses;
-- SIP usernames, authentication names, or passwords;
-- complete onboarding or state URLs;
-- phone numbers, display names, or tenant domains;
-- packet captures, diagnostics bundles, or unredacted configuration files.
+- full Stage 2 or Stage 3 URLs;
+- SIP credentials;
+- unredacted configuration files;
+- packet captures or diagnostics bundles;
+- user names, phone numbers, or tenant information.
 
-Before sharing examples, replace sensitive values with masks such as:
+Use placeholders such as:
 
 ```text
 <MAC12>
