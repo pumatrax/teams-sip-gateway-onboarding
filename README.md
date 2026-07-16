@@ -1,3 +1,14 @@
+
+<p align="center">
+  <img src="assets/teams-logo.png" alt="Microsoft Teams" height="110">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="assets/yealink-logo.png" alt="Yealink" height="80">
+</p>
+
+<h1 align="center">
+  Manual Microsoft Teams SIP Gateway Onboarding for Yealink Devices
+</h1>
+
 # Manual Microsoft Teams SIP Gateway Onboarding for Yealink Devices
 
 This repository documents and automates a tested manual onboarding workflow for certain **Yealink SIP phones** that cannot complete Microsoft Teams SIP Gateway onboarding with their native provisioning or SIP identity.
