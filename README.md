@@ -155,3 +155,30 @@ See the included Word guide for the full procedure and troubleshooting notes.
 ## Current test status
 
 The control flow and staged retrieval have been tested. A complete final validation should be performed with a real lab Yealink phone because the `*55*<verification-code>` step requires an actual temporary SIP account registered on a device.
+
+
+## Tested lab hardware
+
+The following photos show Yealink hardware connected to Microsoft Teams SIP Gateway in the lab.
+
+For Microsoft’s current compatible-device and firmware list, see:
+
+https://learn.microsoft.com/en-us/microsoftteams/devices/sip-gateway-plan
+
+### Yealink T58A connected to Teams SIP Gateway
+
+<p align="center">
+  <img src="assets/yealink-t58a-teams-sip.jpg"
+       alt="Yealink T58A connected to Microsoft Teams SIP Gateway"
+       width="520">
+</p>
+
+### Yealink CP960 connected to Teams SIP Gateway
+
+<p align="center">
+  <img src="assets/yealink-cp960-teams-sip.jpg"
+       alt="Yealink CP960 connected to Microsoft Teams SIP Gateway"
+       width="520">
+</p>
+
+These photos document the lab setup used during testing. Compatibility and support status can change, so verify the model and firmware against Microsoft’s current published list before deployment.
