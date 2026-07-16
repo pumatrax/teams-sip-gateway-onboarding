@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Protect generated credentials, session URLs, and logs.
+umask 077
+
 # Manual Microsoft Teams SIP Gateway onboarding workflow for tested Yealink devices.
 #
 # Usage:
 #   ./teams_onboarding_flow.sh MAC [MODEL] [FIRMWARE]
 #
 # Example:
-#   ./teams_onboarding_flow.sh 805ec033dc69 T57W 96.86.5.1
+#   ./teams_onboarding_flow.sh 805eXXXXdc69 T57W 96.86.5.1
 #
 # Workflow:
 #   1. Download Stage 1 once.
@@ -40,6 +43,7 @@ USER_AGENT="Yealink SIP-${MODEL} ${FIRMWARE} ${MAC_COLON}"
 RUN_ID="$(date '+%Y%m%d-%H%M%S')"
 OUT_DIR="${MAC}-onboarding-${RUN_ID}"
 mkdir -p "$OUT_DIR"
+chmod 700 "$OUT_DIR"
 
 SESSION_FILE="${OUT_DIR}/session.env"
 LOG_FILE="${OUT_DIR}/workflow.log"
@@ -57,7 +61,13 @@ confirm() {
 
     while true; do
         printf '%s [yes/no]: ' "$prompt"
-        IFS= read -r answer
+
+        if ! IFS= read -r answer; then
+            echo >&2
+            echo "Error: input ended before a response was received." >&2
+            return 2
+        fi
+
         normalized="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
 
         case "$normalized" in
@@ -103,37 +113,53 @@ fetch_cfg() {
 
     echo "  HTTP:       $status"
 
-    case "$status" in
-        2??) return 0 ;;
-        *)
-            echo "Error: request failed with HTTP $status" >&2
-            rm -f "$output"
-            return 1
-            ;;
-    esac
+    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+        return 0
+    fi
+
+    echo "Error: request failed with HTTP $status" >&2
+    rm -f "$output"
+    return 1
 }
 
 extract_next_url() {
     local config_file="$1"
+    local value
 
-    [[ -s "$config_file" ]] || return 1
+    if [[ ! -r "$config_file" ]]; then
+        echo "Error: cannot read configuration file: $config_file" >&2
+        return 2
+    fi
 
-    awk '
-        {
-            gsub(/\r/, "", $0)
-        }
-
-        /^[[:space:]]*(static\.)?auto_provision\.server\.url[[:space:]]*=/ {
-            value = $0
-            sub(/^[^=]*=[[:space:]]*/, "", value)
-            sub(/[[:space:]]*(#.*)?$/, "", value)
-
-            if (value != "") {
-                print value
-                exit
+    if ! value="$(
+        awk '
+            {
+                gsub(/\r/, "", $0)
             }
-        }
-    ' "$config_file"
+
+            /^[[:space:]]*(static\.)?auto_provision\.server\.url[[:space:]]*=/ {
+                result = $0
+                sub(/^[^=]*=[[:space:]]*/, "", result)
+                sub(/[[:space:]]*(#.*)?$/, "", result)
+
+                if (result != "") {
+                    print result
+                    found = 1
+                    exit
+                }
+            }
+
+            END {
+                if (!found) {
+                    exit 1
+                }
+            }
+        ' "$config_file"
+    )"; then
+        return 1
+    fi
+
+    printf '%s\n' "$value"
 }
 
 file_hash() {
@@ -148,10 +174,18 @@ show_credential_summary() {
     local config_file="$1"
 
     echo
-    echo "Credential-related values in $(basename "$config_file"):"
+    echo "Credential summary in $(basename "$config_file"):"
+    echo "  Password values are intentionally not printed or written to workflow.log."
+
     grep -Ei \
-        '^[[:space:]]*account\.[0-9]+\.(display_name|label|user_name|auth_name|password|sip_server\.[0-9]+\.address)[[:space:]]*=' \
-        "$config_file" || echo "  No matching credential fields found."
+        '^[[:space:]]*account\.[0-9]+\.(display_name|label|user_name|auth_name|sip_server\.[0-9]+\.address)[[:space:]]*=' \
+        "$config_file" || echo "  No matching non-password fields found."
+
+    if grep -Eiq \
+        '^[[:space:]]*account\.[0-9]+\.password[[:space:]]*=' \
+        "$config_file"; then
+        echo "  account password: [present, redacted]"
+    fi
 }
 
 save_session() {
@@ -186,11 +220,22 @@ echo "The exact Stage 3 URL will be preserved before any import prompts."
 STAGE1_FILE="${OUT_DIR}/${MAC}-stage1.cfg"
 fetch_cfg "$INITIAL_URL" "$STAGE1_FILE" "Stage 1 download" || exit 1
 
-STAGE2_URL="$(extract_next_url "$STAGE1_FILE" || true)"
-if [[ -z "$STAGE2_URL" ]]; then
-    echo "Error: Stage 1 did not contain an auto-provisioning URL." >&2
-    exit 1
-fi
+set +e
+STAGE2_URL="$(extract_next_url "$STAGE1_FILE")"
+rc=$?
+set -e
+
+case "$rc" in
+    0) ;;
+    1)
+        echo "Error: Stage 1 did not contain an auto-provisioning URL." >&2
+        exit 1
+        ;;
+    *)
+        echo "Error: Stage 1 URL extraction failed." >&2
+        exit 1
+        ;;
+esac
 
 echo "  Stage 2 URL: $STAGE2_URL"
 
@@ -201,11 +246,22 @@ echo "  Stage 2 URL: $STAGE2_URL"
 STAGE2_FILE="${OUT_DIR}/${MAC}-stage2.cfg"
 fetch_cfg "$STAGE2_URL" "$STAGE2_FILE" "Stage 2 download" || exit 1
 
-STAGE3_URL="$(extract_next_url "$STAGE2_FILE" || true)"
-if [[ -z "$STAGE3_URL" ]]; then
-    echo "Error: Stage 2 did not contain the Stage 3 URL." >&2
-    exit 1
-fi
+set +e
+STAGE3_URL="$(extract_next_url "$STAGE2_FILE")"
+rc=$?
+set -e
+
+case "$rc" in
+    0) ;;
+    1)
+        echo "Error: Stage 2 did not contain the Stage 3 URL." >&2
+        exit 1
+        ;;
+    *)
+        echo "Error: Stage 2 URL extraction failed." >&2
+        exit 1
+        ;;
+esac
 
 STAGE2_HASH="$(file_hash "$STAGE2_FILE")"
 save_session
