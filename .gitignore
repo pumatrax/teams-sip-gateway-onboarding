@@ -1,0 +1,19 @@
+# Generated onboarding sessions
+*-onboarding-*/
+*-capture/
+
+# Sensitive configuration and session artifacts
+*.cfg
+*.env
+*.log
+*.pcap
+*.pcapng
+*.tar
+*.tgz
+*.zip
+
+# Keep repository documentation
+!Manual_Teams_SIP_Device_Onboarding_Guide.docx
+
+# macOS
+.DS_Store
