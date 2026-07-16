@@ -1,28 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
-# Protect generated credentials, session URLs, and logs.
 umask 077
 
-# Manual Microsoft Teams SIP Gateway onboarding workflow for tested Yealink devices.
+# Interactive Microsoft Teams SIP Gateway onboarding capture for tested Yealink devices.
 #
 # Usage:
 #   ./teams_onboarding_flow.sh MAC [MODEL] [FIRMWARE]
 #
 # Example:
-#   ./teams_onboarding_flow.sh 805eXXXXdc69 T57W 96.86.5.1
+#   ./teams_onboarding_flow.sh 60-22-32-ed-e5-e2 T57W 96.86.5.1
 #
-# Workflow:
-#   1. Download Stage 1 once.
-#   2. Parse Stage 1 and download Stage 2 once.
-#   3. Preserve the exact Stage 3 URL created by Stage 2.
-#   4. Pause for Stage 1 import.
-#   5. Pause for Stage 2 import and phone reboot.
-#   6. Prompt for the TAC verification code and display *55*<code>.
-#   7. Pause for Teams sign-in in a computer browser.
-#   8. Poll the same preserved Stage 3 URL until the configuration changes.
-#
-# Compatible with the Bash 3.2 version included with macOS.
+# IMPORTANT:
+# - This script prints and logs the REAL Stage 2 and Stage 3 URLs so failures
+#   can be diagnosed. Treat workflow.log and session.env as sensitive.
+# - Stage 1 is downloaded once, then imported into the phone.
+# - Stage 2 is not requested until you confirm Stage 1 finished importing.
+# - Stage 2 is downloaded once.
+# - The exact Stage 3 URL returned by Stage 2 is preserved and reused.
+# - Do not publish generated CFG files, workflow.log, or session.env.
 
 INITIAL_URL="http://noam.ipp.sdg.teams.microsoft.com"
 
@@ -50,39 +45,24 @@ LOG_FILE="${OUT_DIR}/workflow.log"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 join_url() {
     printf '%s/%s' "${1%/}" "$2"
 }
 
-redact_url() {
-    printf '%s\n' "$1" |
-        sed -E \
-            -e 's#(/device/ob/)[^/]+#\1<OB-HASH>#' \
-            -e 's#(/device/state/OnBoarding/mmiiaacc/)[^/]+#\1<STATE-TOKEN>#' \
-            -e 's#(/device/mmiiaacc/)[^/]+#\1<STATE-TOKEN>#'
-}
-
-# Read a single line into the named variable, failing cleanly on EOF
-# (e.g. piped/redirected stdin) instead of dying under `set -e` with no message.
-# Returns 2 on EOF so callers can distinguish "no input" from other failures.
 read_line() {
-    local __var="$1"
-    local __prompt="$2"
-    local __value
+    local variable_name="$1"
+    local prompt="$2"
+    local value
 
-    printf '%s' "$__prompt"
+    printf '%s' "$prompt"
 
-    if ! IFS= read -r __value; then
+    if ! IFS= read -r value; then
         echo >&2
         echo "Error: input ended before a response was received." >&2
         return 2
     fi
 
-    printf -v "$__var" '%s' "$__value"
+    printf -v "$variable_name" '%s' "$value"
 }
 
 confirm() {
@@ -128,50 +108,6 @@ require_confirmation() {
     esac
 }
 
-fetch_cfg() {
-    local base_url="$1"
-    local output="$2"
-    local label="$3"
-    local request_url
-    local status
-
-    request_url="$(join_url "$base_url" "${MAC}.cfg")"
-
-    echo
-    echo "$label"
-    echo "  URL:        $(redact_url "$request_url")"
-    echo "  User-Agent: $USER_AGENT"
-
-    status="$(
-        curl \
-            --silent \
-            --show-error \
-            --location \
-            --connect-timeout 15 \
-            --max-time 90 \
-            --retry 2 \
-            --retry-delay 3 \
-            --user-agent "$USER_AGENT" \
-            --output "$output" \
-            --write-out '%{http_code}' \
-            "$request_url"
-    )" || {
-        echo "Error: curl failed for $(redact_url "$request_url")" >&2
-        rm -f "$output"
-        return 1
-    }
-
-    echo "  HTTP:       $status"
-
-    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
-        return 0
-    fi
-
-    echo "Error: request failed with HTTP $status" >&2
-    rm -f "$output"
-    return 1
-}
-
 extract_next_url() {
     local config_file="$1"
     local value
@@ -189,12 +125,12 @@ extract_next_url() {
             }
 
             /^[[:space:]]*(static\.)?auto_provision\.server\.url[[:space:]]*=/ {
-                result = $0
-                sub(/^[^=]*=[[:space:]]*/, "", result)
-                sub(/[[:space:]]*(#.*)?$/, "", result)
+                value = $0
+                sub(/^[^=]*=[[:space:]]*/, "", value)
+                sub(/[[:space:]]*(#.*)?$/, "", value)
 
-                if (result != "") {
-                    print result
+                if (value != "") {
+                    print value
                     found = 1
                     exit
                 }
@@ -216,10 +152,99 @@ extract_next_url() {
     case "$rc" in
         10) return 1 ;;
         *)
-            echo "Error: awk failed while parsing: $config_file" >&2
+            echo "Error: failed to parse provisioning URL from: $config_file" >&2
             return 2
             ;;
     esac
+}
+
+validate_runtime_url() {
+    local url="$1"
+    local label="$2"
+
+    case "$url" in
+        *'<OB-HASH>'*|*'<STATE-TOKEN>'*)
+            echo "Error: $label contains a literal documentation placeholder:" >&2
+            echo "  $url" >&2
+            return 1
+            ;;
+    esac
+
+    case "$url" in
+        http://*|https://*) return 0 ;;
+        *)
+            echo "Error: $label is not an HTTP/HTTPS URL:" >&2
+            echo "  $url" >&2
+            return 1
+            ;;
+    esac
+}
+
+fetch_cfg() {
+    local base_url="$1"
+    local output="$2"
+    local label="$3"
+    local request_url
+    local status
+    local failed_file
+
+    request_url="$(join_url "$base_url" "${MAC}.cfg")"
+
+    echo
+    echo "$label"
+    echo "  REAL URL:   $request_url"
+    echo "  User-Agent: $USER_AGENT"
+    echo "  Output:     $output"
+
+    if status="$(
+        curl \
+            --silent \
+            --show-error \
+            --location \
+            --connect-timeout 15 \
+            --max-time 90 \
+            --retry 2 \
+            --retry-delay 3 \
+            --user-agent "$USER_AGENT" \
+            --output "$output" \
+            --write-out '%{http_code}' \
+            "$request_url"
+    )"; then
+        :
+    else
+        echo "Error: curl failed before a valid HTTP response was completed." >&2
+
+        if [[ -e "$output" ]]; then
+            failed_file="${output}.curl-failed"
+            mv "$output" "$failed_file"
+            chmod 600 "$failed_file"
+            echo "Partial response retained as:"
+            echo "  $failed_file"
+        fi
+
+        return 1
+    fi
+
+    echo "  HTTP:       $status"
+
+    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+        chmod 600 "$output"
+        return 0
+    fi
+
+    failed_file="${output}.http-${status}"
+
+    if [[ -e "$output" ]]; then
+        mv "$output" "$failed_file"
+        chmod 600 "$failed_file"
+        echo "Failed HTTP response retained as:"
+        echo "  $failed_file"
+    else
+        echo "No response body was saved."
+    fi
+
+    echo "Error: request failed with HTTP $status" >&2
+    return 1
 }
 
 file_hash() {
@@ -228,7 +253,7 @@ file_hash() {
     elif command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
     else
-        echo "Error: no SHA-256 tool (shasum or sha256sum) found." >&2
+        echo "Error: no SHA-256 tool found." >&2
         return 1
     fi
 }
@@ -238,7 +263,7 @@ show_credential_summary() {
 
     echo
     echo "Credential summary in $(basename "$config_file"):"
-    echo "  Password values are intentionally not printed or written to workflow.log."
+    echo "  Password values are present in the CFG but are not printed here."
 
     grep -Ei \
         '^[[:space:]]*account\.[0-9]+\.(display_name|label|user_name|auth_name|sip_server\.[0-9]+\.address)[[:space:]]*=' \
@@ -251,20 +276,6 @@ show_credential_summary() {
     fi
 }
 
-# Classify a downloaded Stage 3 config by reading what the stage itself provides,
-# rather than pattern-matching a hard-coded SBC hostname.
-#
-# The onboarding flow's own signals:
-#   - Temporary state: account uses an @onboarding.org user_name, and/or the
-#     provisioning URL still points at the OnBoarding state path.
-#   - Final state: the temporary @onboarding.org account is gone AND the
-#     returned provisioning URL has explicitly moved to the persistent
-#     /device/mmiiaacc/ device path.
-#   - Anything else (including a parse/read failure, or a changed-but-ambiguous
-#     config) is reported as unknown so the caller can save it for review
-#     instead of acting on weak evidence.
-#
-# Prints one of: final | temporary | unknown
 classify_config() {
     local config_file="$1"
     local next_url=""
@@ -278,7 +289,6 @@ classify_config() {
         rc=$?
     fi
 
-    # A parser or file-read failure must not be treated as a final config.
     if [[ "$rc" -eq 2 ]]; then
         printf 'unknown\n'
         return 0
@@ -303,8 +313,6 @@ classify_config() {
         return 0
     fi
 
-    # Strong final signal: the temporary identity is gone and the returned
-    # provisioning URL has explicitly moved to a persistent device path.
     if [[ "$has_temp_account" == "no" &&
           "$rc" -eq 0 &&
           "$next_url" == *"/device/mmiiaacc/"* ]]; then
@@ -312,9 +320,7 @@ classify_config() {
         return 0
     fi
 
-    # The file changed, but there is not enough evidence to call it final.
     printf 'unknown\n'
-    return 0
 }
 
 save_session() {
@@ -332,10 +338,6 @@ EOF_SESSION
     chmod 600 "$SESSION_FILE"
 }
 
-# ---------------------------------------------------------------------------
-# Banner
-# ---------------------------------------------------------------------------
-
 echo "============================================================"
 echo "Teams SIP onboarding workflow"
 echo "============================================================"
@@ -345,108 +347,110 @@ echo "Firmware:   $FIRMWARE"
 echo "User-Agent: $USER_AGENT"
 echo "Run folder: $OUT_DIR"
 echo
-echo "Stage 1 and Stage 2 will now be downloaded once."
-echo "The exact Stage 3 URL will be preserved before any import prompts."
+echo "WARNING:"
+echo "  This run prints and logs the real provisioning URLs."
+echo "  Do not share or commit $LOG_FILE or $SESSION_FILE."
 
 # ---------------------------------------------------------------------------
-# Download Stage 1.
+# Stage 1
 # ---------------------------------------------------------------------------
 
 STAGE1_FILE="${OUT_DIR}/${MAC}-stage1.cfg"
 fetch_cfg "$INITIAL_URL" "$STAGE1_FILE" "Stage 1 download" || exit 1
 
-set +e
-STAGE2_URL="$(extract_next_url "$STAGE1_FILE")"
-rc=$?
-set -e
+if STAGE2_URL="$(extract_next_url "$STAGE1_FILE")"; then
+    :
+else
+    rc=$?
+    case "$rc" in
+        1) echo "Error: Stage 1 did not contain an auto-provisioning URL." >&2 ;;
+        *) echo "Error: Stage 1 URL extraction failed." >&2 ;;
+    esac
+    exit 1
+fi
 
-case "$rc" in
-    0) ;;
-    1)
-        echo "Error: Stage 1 did not contain an auto-provisioning URL." >&2
-        exit 1
-        ;;
-    *)
-        echo "Error: Stage 1 URL extraction failed." >&2
-        exit 1
-        ;;
-esac
+validate_runtime_url "$STAGE2_URL" "Stage 2 URL" || exit 1
 
-echo "  Stage 2 URL: $(redact_url "$STAGE2_URL")"
+echo
+echo "Stage 1 supplied this REAL Stage 2 base URL:"
+echo "  $STAGE2_URL"
+echo
+echo "ACTION REQUIRED - STAGE 1:"
+echo "  Upload/import this file into the phone:"
+echo "  $STAGE1_FILE"
+echo
+echo "  Wait for the import to finish before answering yes."
+
+if ! require_confirmation "Has Stage 1 finished importing?"; then
+    echo "Stopped. Files remain in:"
+    echo "  $OUT_DIR"
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
-# Download Stage 2 immediately and preserve Stage 3.
+# Stage 2
 # ---------------------------------------------------------------------------
 
 STAGE2_FILE="${OUT_DIR}/${MAC}-stage2.cfg"
-fetch_cfg "$STAGE2_URL" "$STAGE2_FILE" "Stage 2 download" || exit 1
 
-set +e
-STAGE3_URL="$(extract_next_url "$STAGE2_FILE")"
-rc=$?
-set -e
+if ! fetch_cfg "$STAGE2_URL" "$STAGE2_FILE" "Stage 2 download"; then
+    echo
+    echo "Stage 2 failed."
+    echo "Verify the REAL URL printed above matches Stage 1 exactly, followed by:"
+    echo "  ${MAC}.cfg"
+    echo
+    echo "Do not rerun Stage 1 yet. Inspect the retained HTTP response and log:"
+    echo "  $LOG_FILE"
+    exit 1
+fi
 
-case "$rc" in
-    0) ;;
-    1)
-        echo "Error: Stage 2 did not contain the Stage 3 URL." >&2
-        exit 1
-        ;;
-    *)
-        echo "Error: Stage 2 URL extraction failed." >&2
-        exit 1
-        ;;
-esac
+if STAGE3_URL="$(extract_next_url "$STAGE2_FILE")"; then
+    :
+else
+    rc=$?
+    case "$rc" in
+        1) echo "Error: Stage 2 did not contain a Stage 3 URL." >&2 ;;
+        *) echo "Error: Stage 2 URL extraction failed." >&2 ;;
+    esac
+    exit 1
+fi
 
-STAGE2_HASH="$(file_hash "$STAGE2_FILE")"
+validate_runtime_url "$STAGE3_URL" "Stage 3 URL" || exit 1
+
+STAGE2_HASH="$(file_hash "$STAGE2_FILE")" || exit 1
 save_session
 
 echo
-echo "Both initial configuration files are ready:"
-echo "  Stage 1: $STAGE1_FILE"
-echo "  Stage 2: $STAGE2_FILE"
+echo "Stage 2 saved successfully:"
+echo "  $STAGE2_FILE"
 echo
-echo "Preserved Stage 3 URL:"
-echo "  $(redact_url "$STAGE3_URL")"
+echo "REAL Stage 3 URL preserved:"
+echo "  $STAGE3_URL"
+echo
+echo "Protected session file:"
+echo "  $SESSION_FILE"
 echo
 echo "Stage 2 SHA-256:"
 echo "  $STAGE2_HASH"
 
 show_credential_summary "$STAGE2_FILE"
 
-# ---------------------------------------------------------------------------
-# Import Stage 1.
-# ---------------------------------------------------------------------------
-
-echo
-echo "ACTION REQUIRED - STAGE 1:"
-echo "  Upload/import Stage 1 into the phone:"
-echo "  $STAGE1_FILE"
-
-if ! require_confirmation "Has Stage 1 finished importing?"; then
-    echo "Stopped. All downloaded files remain in: $OUT_DIR"
-    exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Import Stage 2 and reboot.
-# ---------------------------------------------------------------------------
-
 echo
 echo "ACTION REQUIRED - STAGE 2:"
-echo "  Upload/import Stage 2 into the phone:"
+echo "  Upload/import this file into the phone:"
 echo "  $STAGE2_FILE"
 echo
-echo "  The phone should reboot after Stage 2 is applied."
+echo "  Allow the phone to reboot."
 echo "  When it returns, it should show connected and ready for onboarding."
 
-if ! require_confirmation "Has Stage 2 finished importing and has the phone completed its reboot?"; then
-    echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
+if ! require_confirmation "Has Stage 2 finished importing and has the phone rebooted?"; then
+    echo "Stopped. The preserved Stage 3 URL remains in:"
+    echo "  $SESSION_FILE"
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# TAC verification.
+# TAC verification
 # ---------------------------------------------------------------------------
 
 echo
@@ -464,25 +468,27 @@ echo "Dial this from the phone:"
 echo "  *55*${VERIFY_CODE}"
 
 if ! require_confirmation "Did the *55* call complete and place the device into sign-in mode?"; then
-    echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
+    echo "Stopped. Session retained in:"
+    echo "  $SESSION_FILE"
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Browser sign-in.
+# Browser sign-in
 # ---------------------------------------------------------------------------
 
 echo
 echo "Complete Teams sign-in in a computer browser"
 echo "using the Teams phone user account."
 
-if ! require_confirmation "Is the browser sign-in fully completed?"; then
-    echo "Stopped. The preserved Stage 3 URL is saved in: $SESSION_FILE"
+if ! require_confirmation "Is browser sign-in fully complete?"; then
+    echo "Stopped. Session retained in:"
+    echo "  $SESSION_FILE"
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Poll the same Stage 3 URL.
+# Stage 3 polling
 # ---------------------------------------------------------------------------
 
 echo
@@ -507,7 +513,7 @@ if [[ ! "$POLL_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 echo
-echo "Waiting ${WAIT_MINUTES} minute(s) before checking the preserved Stage 3 URL..."
+echo "Waiting ${WAIT_MINUTES} minute(s)..."
 sleep "$((WAIT_MINUTES * 60))"
 
 FINAL_FILE="${OUT_DIR}/${MAC}-stage3-final.cfg"
@@ -521,61 +527,47 @@ while [[ "$attempt" -le "$POLL_ATTEMPTS" ]]; do
 
     echo
     echo "Stage 3 check $attempt of $POLL_ATTEMPTS"
-    echo "  Reusing preserved URL:"
-    echo "  $(redact_url "$STAGE3_URL")"
+    echo "  REAL URL: $(join_url "$STAGE3_URL" "${MAC}.cfg")"
 
     if fetch_cfg "$STAGE3_URL" "$ATTEMPT_FILE" "Stage 3 download"; then
-        ATTEMPT_HASH="$(file_hash "$ATTEMPT_FILE")"
+        ATTEMPT_HASH="$(file_hash "$ATTEMPT_FILE")" || exit 1
         echo "  Stage 3 SHA-256: $ATTEMPT_HASH"
 
         if [[ "$ATTEMPT_HASH" == "$STAGE2_HASH" ]]; then
-            echo "Stage 3 is still identical to Stage 2 (still onboarding)."
+            echo "Stage 3 is still identical to Stage 2."
         else
-            # The config changed. Classify it by the stage's own signals
-            # (temporary onboarding account / provisioning URL transition),
-            # not by a hard-coded SBC hostname.
-            state="$(classify_config "$ATTEMPT_FILE")"
-            echo "  Config changed from Stage 2. Classification: $state"
+            STATE="$(classify_config "$ATTEMPT_FILE")"
+            echo "  Classification: $STATE"
 
-            case "$state" in
+            case "$STATE" in
                 final)
                     cp "$ATTEMPT_FILE" "$FINAL_FILE"
                     chmod 600 "$FINAL_FILE"
                     UPDATED=1
 
                     echo
-                    echo "Final Stage 3 configuration detected."
-                    echo "  (Temporary onboarding account cleared; provisioning URL"
-                    echo "   moved to the persistent /device/mmiiaacc/ path.)"
-                    echo "Final configuration saved as:"
+                    echo "Final Stage 3 configuration detected:"
                     echo "  $FINAL_FILE"
-
                     show_credential_summary "$FINAL_FILE"
                     break
                     ;;
                 temporary)
-                    echo "Config changed but still shows onboarding-stage indicators."
-                    echo "Continuing to poll the same preserved URL."
+                    echo "The config changed but still contains onboarding indicators."
                     ;;
                 *)
-                    # Changed, but neither clearly temporary nor clearly final.
-                    # Do NOT discard it: save the most recent changed config as a
-                    # candidate so a naming/convention surprise degrades to
-                    # "here's a likely-final config, verify it" instead of a loss.
                     cp "$ATTEMPT_FILE" "$CANDIDATE_FILE"
                     chmod 600 "$CANDIDATE_FILE"
                     CANDIDATE_SAVED=1
-                    echo "Config changed but could not be positively classified."
-                    echo "Saved as a candidate for manual review:"
+
+                    echo "Changed config saved for manual review:"
                     echo "  $CANDIDATE_FILE"
-                    echo "Continuing to poll in case a clearer final config arrives."
                     ;;
             esac
         fi
     fi
 
     if [[ "$attempt" -lt "$POLL_ATTEMPTS" ]]; then
-        echo "Waiting 60 seconds before checking the same URL again..."
+        echo "Waiting 60 seconds before the next check..."
         sleep 60
     fi
 
@@ -586,32 +578,18 @@ echo
 echo "============================================================"
 
 if [[ "$UPDATED" -eq 1 ]]; then
-    echo "Final onboarding configuration detected."
-    echo "Upload/import this file into the phone:"
+    echo "Upload/import the final file:"
     echo "  $FINAL_FILE"
 elif [[ "$CANDIDATE_SAVED" -eq 1 ]]; then
-    echo "No positively-verified final config was detected, but the Stage 3"
-    echo "configuration DID change from Stage 2. A candidate was saved:"
+    echo "No positively classified final config was found."
+    echo "Review the changed candidate:"
     echo "  $CANDIDATE_FILE"
-    echo
-    echo "Review it manually. If it contains your assigned user account and a"
-    echo "production (non-onboarding) SIP server, it is likely the final config."
     echo "Do not rerun Stage 1 or Stage 2."
 else
-    echo "No Stage 3 change was detected during the polling window."
+    echo "No Stage 3 change was detected."
     echo "Do not rerun Stage 1 or Stage 2."
-    echo "The preserved session is saved in:"
+    echo "Session details remain in:"
     echo "  $SESSION_FILE"
-    echo
-    echo "Manual retry command:"
-    echo "  Source the protected session file first:"
-    echo "    . \"$SESSION_FILE\""
-    echo
-    echo "  Then run:"
-    echo "    curl -v -L \\"
-    echo "      -A \"\$USER_AGENT\" \\"
-    echo "      \"\${STAGE3_URL%/}/\${MAC}.cfg\" \\"
-    echo "      -o \"\${MAC}-stage3-later.cfg\""
 fi
 
 echo
